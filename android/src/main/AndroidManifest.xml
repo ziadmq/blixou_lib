@@ -1,0 +1,4 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+  package="com.softians.cli_blixou.blixou_lib">
+    <uses-permission android:name="android.permission.CAMERA" />
+</manifest>

@@ -12,7 +12,6 @@ import io.flutter.plugin.common.MethodChannel.MethodCallHandler
 import io.flutter.plugin.common.MethodChannel.Result
 import org.webrtc.VideoSource
 import java.lang.reflect.Modifier
-import com.cloudwebrtc.webrtc.FlutterWebRTCPlugin
 
 /** BlixouLibPlugin */
 class BlixouLibPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
@@ -20,11 +19,17 @@ class BlixouLibPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
     private var activeProcessor: BeautyVideoProcessor? = null
     private var activity: Activity? = null
 
+    // ─── دالة forceReinit آمنة: لا تفعل شيئاً إذا لم يكن هناك معالج نشط ────
     private val lifecycleCallbacks = object : Application.ActivityLifecycleCallbacks {
         override fun onActivityResumed(act: Activity) {
             if (act == activity) {
                 android.util.Log.i("BlixouLib", "Activity resumed: Triggering OpenGL/EGL Context loss recovery...")
-                activeProcessor?.forceReinit()
+                // ✅ آمن: forceReinit فقط يضع علامة boolean، لا يستدعي GLES مباشرة
+                try {
+                    activeProcessor?.forceReinit()
+                } catch (e: Throwable) {
+                    android.util.Log.e("BlixouLib", "forceReinit error (ignored): ${e.message}")
+                }
             }
         }
         override fun onActivityPaused(act: Activity) {}
@@ -32,7 +37,17 @@ class BlixouLibPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
         override fun onActivityStopped(act: Activity) {}
         override fun onActivitySaveInstanceState(act: Activity, outState: Bundle) {}
         override fun onActivityCreated(act: Activity, savedInstanceState: Bundle?) {}
-        override fun onActivityDestroyed(act: Activity) {}
+        override fun onActivityDestroyed(act: Activity) {
+            // ✅ أطلق الموارد عند تدمير الـ Activity لمنع memory leaks
+            if (act == activity) {
+                try {
+                    activeProcessor?.release()
+                    activeProcessor = null
+                } catch (e: Throwable) {
+                    android.util.Log.e("BlixouLib", "onActivityDestroyed cleanup error: ${e.message}")
+                }
+            }
+        }
     }
 
     override fun onAttachedToEngine(flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
@@ -52,16 +67,27 @@ class BlixouLibPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
                     result.error("INVALID_ARGUMENT", "trackId cannot be null", null)
                     return
                 }
-                val success = applyBeautyFilter(trackId, intensity)
-                if (success) {
-                    result.success(true)
-                } else {
-                    result.error("TRACK_NOT_FOUND", "Could not find native WebRTC VideoSource for trackId: $trackId", null)
+                try {
+                    val success = applyBeautyFilter(trackId, intensity)
+                    if (success) {
+                        result.success(true)
+                    } else {
+                        // ✅ نُعيد false بدلاً من error لمنع exception في Dart
+                        result.success(false)
+                        android.util.Log.w("BlixouLib", "applyToTrack: VideoSource not found for trackId=$trackId")
+                    }
+                } catch (e: Throwable) {
+                    android.util.Log.e("BlixouLib", "applyToTrack exception: ${e.message}", e)
+                    result.success(false) // ✅ لا ترمي error يسبب exception في Dart
                 }
             }
             "setIntensity" -> {
                 val intensity = call.argument<Double>("intensity")?.toFloat() ?: 0.5f
-                updateIntensity(intensity)
+                try {
+                    updateIntensity(intensity)
+                } catch (e: Throwable) {
+                    android.util.Log.e("BlixouLib", "setIntensity exception: ${e.message}", e)
+                }
                 result.success(true)
             }
             else -> {
@@ -70,143 +96,120 @@ class BlixouLibPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
         }
     }
 
+    // ─── باحث VideoSource بالانعكاس (Reflection) ──────────────────────────────
+    private fun findVideoSourceResiliently(obj: Any?, visited: MutableSet<Any>, depth: Int): VideoSource? {
+        if (obj == null || depth > 5 || visited.contains(obj)) return null
+        visited.add(obj)
+
+        if (obj is VideoSource) return obj
+
+        if (obj is Map<*, *>) {
+            for (value in obj.values) {
+                val found = findVideoSourceResiliently(value, visited, depth + 1)
+                if (found != null) return found
+            }
+        }
+
+        if (obj is Collection<*>) {
+            for (value in obj) {
+                val found = findVideoSourceResiliently(value, visited, depth + 1)
+                if (found != null) return found
+            }
+        }
+
+        var clazz: Class<*>? = obj.javaClass
+        while (clazz != null && !clazz.name.startsWith("java.") && !clazz.name.startsWith("android.")) {
+            for (field in clazz.declaredFields) {
+                try {
+                    if (Modifier.isStatic(field.modifiers)) continue
+                    field.isAccessible = true
+                    val fieldValue = field.get(obj)
+                    if (fieldValue != null) {
+                        val found = findVideoSourceResiliently(fieldValue, visited, depth + 1)
+                        if (found != null) return found
+                    }
+                } catch (e: Throwable) {
+                    // تجاهل أخطاء الوصول
+                }
+            }
+            clazz = clazz.superclass
+        }
+        return null
+    }
+
     private fun findVideoSource(trackId: String): VideoSource? {
-        try {
+        return try {
             val pluginClass = Class.forName("com.cloudwebrtc.webrtc.FlutterWebRTCPlugin")
 
-            // 1. Resilient Lookup: Find any static field containing an instance of FlutterWebRTCPlugin
             var pluginInstance: Any? = null
             for (field in pluginClass.declaredFields) {
                 if (Modifier.isStatic(field.modifiers) && pluginClass.isAssignableFrom(field.type)) {
                     field.isAccessible = true
                     pluginInstance = field.get(null)
-                    if (pluginInstance != null) {
-                        break
-                    }
+                    if (pluginInstance != null) break
                 }
             }
 
             if (pluginInstance == null) {
-                android.util.Log.w("BlixouLib", "Resilient Lookup: FlutterWebRTCPlugin singleton instance not found in static fields.")
+                android.util.Log.w("BlixouLib", "FlutterWebRTCPlugin instance not found in static fields")
                 return null
             }
 
-            // 2. Resilient Lookup: Find methodCallHandler field by type ending in MethodCallHandlerImpl
-            var methodCallHandler: Any? = null
-            for (field in pluginClass.declaredFields) {
-                if (field.type.name.endsWith("MethodCallHandlerImpl")) {
-                    field.isAccessible = true
-                    methodCallHandler = field.get(pluginInstance)
-                    if (methodCallHandler != null) {
-                        break
-                    }
-                }
+            val source = findVideoSourceResiliently(pluginInstance, HashSet(), 0)
+            if (source != null) {
+                android.util.Log.i("BlixouLib", "VideoSource found successfully via reflection")
             }
-
-            if (methodCallHandler == null) {
-                try {
-                    val field = pluginClass.getDeclaredField("methodCallHandler").apply { isAccessible = true }
-                    methodCallHandler = field.get(pluginInstance)
-                } catch (e: Exception) {
-                    // Ignore
-                }
-            }
-
-            if (methodCallHandler == null) {
-                android.util.Log.w("BlixouLib", "Resilient Lookup: MethodCallHandlerImpl instance not found.")
-                return null
-            }
-
-            // 3. Resilient Lookup: Find getUserMediaImpl field by type ending in GetUserMediaImpl
-            var getUserMedia: Any? = null
-            val handlerClass = methodCallHandler.javaClass
-            for (field in handlerClass.declaredFields) {
-                if (field.type.name.endsWith("GetUserMediaImpl")) {
-                    field.isAccessible = true
-                    getUserMedia = field.get(methodCallHandler)
-                    if (getUserMedia != null) {
-                        break
-                    }
-                }
-            }
-
-            if (getUserMedia == null) {
-                try {
-                    val field = handlerClass.getDeclaredField("getUserMediaImpl").apply { isAccessible = true }
-                    getUserMedia = field.get(methodCallHandler)
-                } catch (e: Exception) {
-                    // Ignore
-                }
-            }
-
-            if (getUserMedia == null) {
-                android.util.Log.w("BlixouLib", "Resilient Lookup: GetUserMediaImpl instance not found.")
-                return null
-            }
-
-            // 4. Resilient Lookup: Find videoSource field inside GetUserMediaImpl by scanning for VideoSource type
-            val getUserMediaClass = getUserMedia.javaClass
-            for (field in getUserMediaClass.declaredFields) {
-                if (VideoSource::class.java.isAssignableFrom(field.type)) {
-                    field.isAccessible = true
-                    val source = field.get(getUserMedia) as? VideoSource
-                    if (source != null) {
-                        return source
-                    }
-                }
-            }
-
-            // Fallback: Check localTracks map registry inside methodCallHandler
-            for (field in handlerClass.declaredFields) {
-                if (Map::class.java.isAssignableFrom(field.type)) {
-                    field.isAccessible = true
-                    val map = field.get(methodCallHandler) as? Map<*, *>
-                    val localTrack = map?.get(trackId)
-                    if (localTrack != null) {
-                        for (trackField in localTrack.javaClass.declaredFields) {
-                            if (VideoSource::class.java.isAssignableFrom(trackField.type)) {
-                                trackField.isAccessible = true
-                                val source = trackField.get(localTrack) as? VideoSource
-                                if (source != null) {
-                                    return source
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-        } catch (e: Exception) {
-            android.util.Log.e("BlixouLib", "Resilient reflection lookup failed: ${e.message}")
+            source
+        } catch (e: Throwable) {
+            android.util.Log.e("BlixouLib", "findVideoSource failed: ${e.message}")
+            null
         }
-
-        return null
     }
 
     private fun applyBeautyFilter(trackId: String, intensity: Float): Boolean {
-        val videoSource = findVideoSource(trackId) ?: return false
+        return try {
+            val videoSource = findVideoSource(trackId) ?: return false
 
-        activeProcessor?.release()
+            // ✅ أطلق المعالج القديم بأمان قبل إنشاء معالج جديد
+            try {
+                activeProcessor?.release()
+            } catch (e: Throwable) {
+                android.util.Log.w("BlixouLib", "Old processor release error (ignored): ${e.message}")
+            }
+            activeProcessor = null
 
-        val processor = BeautyVideoProcessor()
-        processor.setIntensity(intensity)
+            val processor = BeautyVideoProcessor()
+            processor.setIntensity(intensity)
+            videoSource.setVideoProcessor(processor)
+            activeProcessor = processor
 
-        videoSource.setVideoProcessor(processor)
-        activeProcessor = processor
-        return true
+            android.util.Log.i("BlixouLib", "Beauty filter applied ✅ trackId=$trackId intensity=$intensity")
+            true
+        } catch (e: Throwable) {
+            android.util.Log.e("BlixouLib", "applyBeautyFilter failed: ${e.message}", e)
+            false
+        }
     }
 
     private fun updateIntensity(intensity: Float) {
-        activeProcessor?.setIntensity(intensity)
+        try {
+            activeProcessor?.setIntensity(intensity)
+        } catch (e: Throwable) {
+            android.util.Log.e("BlixouLib", "updateIntensity error: ${e.message}")
+        }
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         channel.setMethodCallHandler(null)
-        activeProcessor?.release()
+        try {
+            activeProcessor?.release()
+        } catch (e: Throwable) {
+            android.util.Log.e("BlixouLib", "onDetachedFromEngine cleanup error: ${e.message}")
+        }
         activeProcessor = null
     }
 
-    // Activity Lifecycle Observability implementation
+    // ─── دورة حياة الـ Activity ───────────────────────────────────────────────
     override fun onAttachedToActivity(binding: ActivityPluginBinding) {
         activity = binding.activity
         activity?.application?.registerActivityLifecycleCallbacks(lifecycleCallbacks)

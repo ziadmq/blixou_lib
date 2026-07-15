@@ -121,9 +121,12 @@ const char* FRAGMENT_SHADER_SRC =
 
 BeautyFilter::BeautyFilter() 
     : mProgram(0), mPositionLoc(0), mTexCoordLoc(0), mTextureLoc(0), 
-      mIntensityLoc(0), mTexelSizeLoc(0), mFaceBoundsLoc(0), mFBO(0), mOutputTexture(0),
-      mWidth(0), mHeight(0), mIntensity(0.5f),
+      mIntensityLoc(0), mTexelSizeLoc(0), mFaceBoundsLoc(0), mFBO(0),
+      mTextureIndex(0), mWidth(0), mHeight(0), mIntensity(0.5f),
       mMinX(0.0f), mMinY(0.0f), mMaxX(0.0f), mMaxY(0.0f), mInitialized(false) {
+    for (int i = 0; i < 3; i++) {
+        mOutputTextures[i] = 0;
+    }
 #ifndef __APPLE__
     mEglContext = EGL_NO_CONTEXT;
 #endif
@@ -162,24 +165,29 @@ void BeautyFilter::setupFBO(int width, int height) {
     
     if (mFBO != 0) {
         glDeleteFramebuffers(1, &mFBO);
-        glDeleteTextures(1, &mOutputTexture);
+        glDeleteTextures(3, mOutputTextures);
         mFBO = 0;
-        mOutputTexture = 0;
+        for (int i = 0; i < 3; i++) {
+            mOutputTextures[i] = 0;
+        }
     }
 
     glGenFramebuffers(1, &mFBO);
     glBindFramebuffer(GL_FRAMEBUFFER, mFBO);
 
-    glGenTextures(1, &mOutputTexture);
-    glBindTexture(GL_TEXTURE_2D, mOutputTexture);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-    
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glGenTextures(3, mOutputTextures);
+    for (int i = 0; i < 3; i++) {
+        glBindTexture(GL_TEXTURE_2D, mOutputTextures[i]);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
 
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, mOutputTexture, 0);
+    // Bind initial texture to avoid incomplete framebuffer issues during setup
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, mOutputTextures[0], 0);
 
     GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
     if (status != GL_FRAMEBUFFER_COMPLETE) {
@@ -191,6 +199,7 @@ void BeautyFilter::setupFBO(int width, int height) {
     
     mWidth = width;
     mHeight = height;
+    mTextureIndex = 0;
 }
 
 void BeautyFilter::init(int width, int height) {
@@ -269,7 +278,9 @@ GLuint BeautyFilter::processTexture(GLuint inputTextureId, int width, int height
         LOGI("BeautyFilter: EGL context changed/lost! Invalidating old handles and re-initializing...");
         mProgram = 0;
         mFBO = 0;
-        mOutputTexture = 0;
+        for (int i = 0; i < 3; i++) {
+            mOutputTextures[i] = 0;
+        }
         mInitialized = false;
         
         init(width, height);
@@ -283,6 +294,10 @@ GLuint BeautyFilter::processTexture(GLuint inputTextureId, int width, int height
 
     setupFBO(width, height);
 
+    // Cycle through triple textures to prevent screen tearing/overwrites (Double/Triple Buffering)
+    mTextureIndex = (mTextureIndex + 1) % 3;
+    GLuint outputTex = mOutputTextures[mTextureIndex];
+
     GLint prevFBO;
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFBO);
     GLint prevViewport[4];
@@ -290,6 +305,7 @@ GLuint BeautyFilter::processTexture(GLuint inputTextureId, int width, int height
 
     glBindFramebuffer(GL_FRAMEBUFFER, mFBO);
     glViewport(0, 0, width, height);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, outputTex, 0);
 
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
@@ -333,13 +349,12 @@ GLuint BeautyFilter::processTexture(GLuint inputTextureId, int width, int height
     glBindFramebuffer(GL_FRAMEBUFFER, prevFBO);
     glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
 
-    return mOutputTexture;
+    return outputTex;
 }
 
 void BeautyFilter::release() {
     if (mProgram != 0) {
 #ifndef __APPLE__
-        // Only delete programs if context is still active
         if (eglGetCurrentContext() == mEglContext) {
             glDeleteProgram(mProgram);
         }
@@ -352,14 +367,16 @@ void BeautyFilter::release() {
 #ifndef __APPLE__
         if (eglGetCurrentContext() == mEglContext) {
             glDeleteFramebuffers(1, &mFBO);
-            glDeleteTextures(1, &mOutputTexture);
+            glDeleteTextures(3, mOutputTextures);
         }
 #else
         glDeleteFramebuffers(1, &mFBO);
-        glDeleteTextures(1, &mOutputTexture);
+        glDeleteTextures(3, mOutputTextures);
 #endif
         mFBO = 0;
-        mOutputTexture = 0;
+        for (int i = 0; i < 3; i++) {
+            mOutputTextures[i] = 0;
+        }
     }
     mInitialized = false;
 #ifndef __APPLE__

@@ -34,7 +34,8 @@ private:
     GLuint mFaceBoundsLoc;
 
     GLuint mFBO;
-    GLuint mOutputTexture;
+    GLuint mOutputTextures[3]; // Triple output textures for tearing prevention
+    int mTextureIndex;
     int mWidth;
     int mHeight;
     float mIntensity;

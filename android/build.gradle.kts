@@ -51,6 +51,7 @@ android {
 
     defaultConfig {
         minSdk = 24
+        consumerProguardFiles("proguard-rules.pro")
         externalNativeBuild {
             cmake {
                 cppFlags("-std=c++14")

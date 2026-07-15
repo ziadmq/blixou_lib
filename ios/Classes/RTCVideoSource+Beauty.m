@@ -257,7 +257,9 @@ void set_global_beauty_intensity(float intensity) {
     process_texture(g_filterId, srcTextureId, g_width, g_height);
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glFinish(); // Sync drawing commands to complete GPU pipeline before returning buffer
+    
+    // Flush OpenGL pipeline asynchronously to prevent CPU block (replaces glFinish)
+    glFlush();
 
     CFRelease(srcTextureRef);
     CFRelease(dstTextureRef);

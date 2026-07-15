@@ -208,6 +208,9 @@ class BeautyVideoProcessor : VideoProcessor {
 
                 if (nv21Bytes != null) {
                     val currentRotation = frame.rotation
+                    val matrixValues = FloatArray(9)
+                    buffer.transformMatrix.getValues(matrixValues)
+                    val isMirrored = matrixValues[0] < 0.0f
                     faceDetectionExecutor.execute {
                         try {
                             val inputImage = InputImage.fromByteBuffer(
@@ -229,17 +232,67 @@ class BeautyVideoProcessor : VideoProcessor {
                                             val imgWidth = if (isRotated) h else w
                                             val imgHeight = if (isRotated) w else h
 
-                                            // Normalize coordinates
+                                            // Normalize portrait coordinates
                                             val leftNorm = box.left.toFloat() / imgWidth
                                             val rightNorm = box.right.toFloat() / imgWidth
                                             val topNorm = box.top.toFloat() / imgHeight
                                             val bottomNorm = box.bottom.toFloat() / imgHeight
 
-                                            // Convert Top-Left origin (ML Kit) to Bottom-Left origin (OpenGL)
-                                            val glMinX = leftNorm
-                                            val glMaxX = rightNorm
-                                            val glMinY = 1.0f - bottomNorm
-                                            val glMaxY = 1.0f - topNorm
+                                            // Add 15% horizontal and 20% vertical padding/margins
+                                            val widthNorm = rightNorm - leftNorm
+                                            val heightNorm = bottomNorm - topNorm
+                                            val marginX = widthNorm * 0.15f
+                                            val marginY = heightNorm * 0.20f
+
+                                            val paddedLeft = (leftNorm - marginX).coerceAtLeast(0.0f)
+                                            val paddedRight = (rightNorm + marginX).coerceAtMost(1.0f)
+                                            val paddedTop = (topNorm - marginY).coerceAtLeast(0.0f)
+                                            val paddedBottom = (bottomNorm + marginY).coerceAtMost(1.0f)
+
+                                            // Map portrait coordinates back to the raw camera sensor space
+                                            var glMinX = paddedLeft
+                                            var glMaxX = paddedRight
+                                            var glMinY = 1.0f - paddedBottom
+                                            var glMaxY = 1.0f - paddedTop
+
+                                            if (currentRotation == 90) {
+                                                glMinX = 1.0f - paddedBottom
+                                                glMaxX = 1.0f - paddedTop
+                                                glMinY = paddedLeft
+                                                glMaxY = paddedRight
+                                                if (isMirrored) {
+                                                    val temp = glMinY
+                                                    glMinY = 1.0f - glMaxY
+                                                    glMaxY = 1.0f - temp
+                                                }
+                                            } else if (currentRotation == 270) {
+                                                glMinX = paddedTop
+                                                glMaxX = paddedBottom
+                                                glMinY = 1.0f - paddedRight
+                                                glMaxY = 1.0f - paddedLeft
+                                                if (isMirrored) {
+                                                    val temp = glMinY
+                                                    glMinY = 1.0f - glMaxY
+                                                    glMaxY = 1.0f - temp
+                                                }
+                                            } else if (currentRotation == 180) {
+                                                glMinX = 1.0f - paddedRight
+                                                glMaxX = 1.0f - paddedLeft
+                                                glMinY = paddedTop
+                                                glMaxY = paddedBottom
+                                                if (isMirrored) {
+                                                    // For 180 degrees, horizontal mirror flips the Y-axis in landscape
+                                                    val temp = glMinY
+                                                    glMinY = 1.0f - glMaxY
+                                                    glMaxY = 1.0f - temp
+                                                }
+                                            } else { // 0 degrees
+                                                if (isMirrored) {
+                                                    val temp = glMinX
+                                                    glMinX = 1.0f - glMaxX
+                                                    glMaxX = 1.0f - temp
+                                                }
+                                            }
 
                                             if (filterId != 0) {
                                                 BeautyVideoProcessorJni.safeSetFaceBounds(filterId, glMinX, glMinY, glMaxX, glMaxY)
@@ -303,6 +356,8 @@ class BeautyVideoProcessor : VideoProcessor {
             val identityMatrix = Matrix()
 
             val processedBuffer = object : VideoFrame.TextureBuffer {
+                private var yuvConverter: YuvConverter? = null
+
                 override fun getWidth(): Int = capturedWidth
                 override fun getHeight(): Int = capturedHeight
                 override fun getType(): VideoFrame.TextureBuffer.Type = VideoFrame.TextureBuffer.Type.RGB
@@ -310,7 +365,15 @@ class BeautyVideoProcessor : VideoProcessor {
                 override fun getTransformMatrix(): Matrix = identityMatrix
 
                 override fun toI420(): VideoFrame.I420Buffer {
-                    return buffer.toI420()!!
+                    return try {
+                        if (yuvConverter == null) {
+                            yuvConverter = YuvConverter()
+                        }
+                        yuvConverter!!.convert(this) ?: buffer.toI420()!!
+                    } catch (e: Exception) {
+                        android.util.Log.e("BlixouLib", "YuvConverter failed, falling back to raw buffer: ${e.message}")
+                        buffer.toI420()!!
+                    }
                 }
 
                 override fun retain() {
@@ -318,6 +381,8 @@ class BeautyVideoProcessor : VideoProcessor {
                 }
 
                 override fun release() {
+                    yuvConverter?.release()
+                    yuvConverter = null
                     buffer.release() // ✅ يُحرِّر الـ retain الإضافي الذي أضفناه
                 }
 

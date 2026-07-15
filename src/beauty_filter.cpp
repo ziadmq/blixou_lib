@@ -28,7 +28,7 @@ const char* FRAGMENT_SHADER_SRC =
     "uniform vec2 uTexelSize;\n"
     "uniform vec4 uFaceBounds;\n" // x: minX, y: minY, z: maxX, w: maxY
     "\n"
-    "// HSV skin color detection\n"
+    "// Continuous HSV skin color detection including red/pink skin tones\n"
     "float getSkinWeight(vec3 rgb) {\n"
     "    float r = rgb.r;\n"
     "    float g = rgb.g;\n"
@@ -53,15 +53,17 @@ const char* FRAGMENT_SHADER_SRC =
     "    float s = maxVal > 0.0 ? delta / maxVal : 0.0;\n"
     "    float v = maxVal;\n"
     "    \n"
-    "    // Skin HSV ranges: H in [0, 45] or [340, 360], S in [0.15, 0.7], V in [0.3, 1.0]\n"
+    "    // Skin Hue (H) in [0, 50] or [310, 360] (covering reddish and golden skin tones)\n"
     "    float hWeight = 0.0;\n"
-    "    if (h <= 45.0) {\n"
-    "        hWeight = smoothstep(0.0, 8.0, h);\n"
-    "    } else if (h >= 340.0) {\n"
-    "        hWeight = smoothstep(360.0, 350.0, h);\n"
+    "    if (h <= 50.0 || h >= 310.0) {\n"
+    "        hWeight = 1.0;\n"
     "    }\n"
-    "    float sWeight = smoothstep(0.12, 0.20, s) * (1.0 - smoothstep(0.65, 0.75, s));\n"
-    "    float vWeight = smoothstep(0.25, 0.35, v);\n"
+    "    \n"
+    "    // Saturation (S) in [0.08, 0.70]\n"
+    "    float sWeight = smoothstep(0.06, 0.15, s) * (1.0 - smoothstep(0.65, 0.75, s));\n"
+    "    \n"
+    "    // Value/Brightness (V) in [0.15, 1.0]\n"
+    "    float vWeight = smoothstep(0.12, 0.25, v);\n"
     "    \n"
     "    return hWeight * sWeight * vWeight;\n"
     "}\n"
@@ -73,9 +75,8 @@ const char* FRAGMENT_SHADER_SRC =
     "        return;\n"
     "    }\n"
     "    \n"
-    "    // Optimization & Bounding Box Check:\n"
-    "    // If no face is detected (bounds are zero/empty), or if coordinates lie outside the face bounds,\n"
-    "    // exit immediately and return the center pixel color. This saves 25 texture fetches (GPU bypass).\n"
+    "    // Bounding Box Check:\n"
+    "    // If coordinates lie outside the face bounds, return original color.\n"
     "    if (uFaceBounds.z <= 0.0 && uFaceBounds.w <= 0.0) {\n"
     "        gl_FragColor = centerColor;\n"
     "        return;\n"
@@ -90,13 +91,13 @@ const char* FRAGMENT_SHADER_SRC =
     "    float totalWeight = 0.0;\n"
     "    vec3 sumColor = vec3(0.0);\n"
     "    \n"
-    "    float sigmaD = 3.0; // Spatial standard deviation\n"
-    "    float sigmaR = 0.12 * uIntensity; // Color standard deviation scaled by intensity\n"
+    "    float sigmaD = 4.0; // Spatial standard deviation\n"
+    "    float sigmaR = 0.05 + 0.15 * uIntensity; // Color standard deviation\n"
     "    \n"
-    "    // 5x5 Bilateral Filter\n"
+    "    // 5x5 Bilateral Filter with dynamic stride scaled by intensity for high resolution screens\n"
     "    for (int i = -2; i <= 2; i++) {\n"
     "        for (int j = -2; j <= 2; j++) {\n"
-    "            vec2 offset = vec2(float(i), float(j)) * uTexelSize;\n"
+    "            vec2 offset = vec2(float(i), float(j)) * uTexelSize * (1.0 + 2.5 * uIntensity);\n"
     "            vec4 neighborColor = texture2D(sTexture, vTextureCoord + offset);\n"
     "            \n"
     "            float distSqr = float(i * i + j * j);\n"
@@ -114,7 +115,7 @@ const char* FRAGMENT_SHADER_SRC =
     "    vec3 blurred = sumColor / totalWeight;\n"
     "    float skinWeight = getSkinWeight(centerColor.rgb);\n"
     "    \n"
-    "    // Apply skin smoothing filter only to skin area inside the bounding box\n"
+    "    // Apply bilateral filter only to skin area inside the bounding box\n"
     "    vec3 finalColor = mix(centerColor.rgb, blurred, skinWeight * uIntensity);\n"
     "    gl_FragColor = vec4(finalColor, centerColor.a);\n"
     "}\n";
@@ -123,7 +124,7 @@ BeautyFilter::BeautyFilter()
     : mProgram(0), mPositionLoc(0), mTexCoordLoc(0), mTextureLoc(0), 
       mIntensityLoc(0), mTexelSizeLoc(0), mFaceBoundsLoc(0), mFBO(0),
       mTextureIndex(0), mWidth(0), mHeight(0), mIntensity(0.5f),
-      mMinX(0.0f), mMinY(0.0f), mMaxX(0.0f), mMaxY(0.0f), mInitialized(false) {
+      mMinX(0.0f), mMinY(0.0f), mMaxX(1.0f), mMaxY(1.0f), mInitialized(false) {
     for (int i = 0; i < 3; i++) {
         mOutputTextures[i] = 0;
     }
@@ -186,7 +187,6 @@ void BeautyFilter::setupFBO(int width, int height) {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     }
 
-    // Bind initial texture to avoid incomplete framebuffer issues during setup
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, mOutputTextures[0], 0);
 
     GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
@@ -294,7 +294,6 @@ GLuint BeautyFilter::processTexture(GLuint inputTextureId, int width, int height
 
     setupFBO(width, height);
 
-    // Cycle through triple textures to prevent screen tearing/overwrites (Double/Triple Buffering)
     mTextureIndex = (mTextureIndex + 1) % 3;
     GLuint outputTex = mOutputTextures[mTextureIndex];
 

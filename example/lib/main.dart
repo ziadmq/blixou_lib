@@ -97,28 +97,40 @@ class _BeautyDemoScreenState extends State<BeautyDemoScreen> {
     }
   }
 
+  bool _isFilterInitialized = false;
+
   Future<void> _toggleBeautyFilter(bool enabled) async {
     if (_localVideoTrack == null) return;
     
     try {
       if (enabled) {
-        // Apply the beauty filter to the WebRTC video track ID
-        final success = await _blixouLib.applyToTrack(
-          _localVideoTrack!.id!,
-          intensity: _beautyIntensity,
-        );
-        if (success) {
+        if (!_isFilterInitialized) {
+          // Bind the VideoProcessor once
+          final success = await _blixouLib.applyToTrack(
+            _localVideoTrack!.id!,
+            intensity: _beautyIntensity,
+          );
+          if (success) {
+            setState(() {
+              _isFilterInitialized = true;
+              _isBeautyFilterEnabled = true;
+              _statusMessage = 'Beauty Filter Active';
+            });
+          } else {
+            setState(() {
+              _statusMessage = 'Failed to bind VideoProcessor';
+            });
+          }
+        } else {
+          // If already bound, just restore the active intensity
+          await _blixouLib.setIntensity(_beautyIntensity);
           setState(() {
             _isBeautyFilterEnabled = true;
             _statusMessage = 'Beauty Filter Active';
           });
-        } else {
-          setState(() {
-            _statusMessage = 'Failed to bind VideoProcessor';
-          });
         }
       } else {
-        // Disabling filter is achieved by setting intensity to 0
+        // Disabling filter is achieved by setting intensity to 0 (no shader processing)
         await _blixouLib.setIntensity(0.0);
         setState(() {
           _isBeautyFilterEnabled = false;

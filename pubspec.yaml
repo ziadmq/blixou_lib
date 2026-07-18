@@ -1,7 +1,8 @@
 name: blixou_lib
-description: "A new Flutter project."
+description: "A Flutter plugin for beauty filters and image processing using C++ native implementation."
 version: 0.0.1
-homepage:
+homepage: https://github.com/softians/blixou_lib
+
 
 environment:
   sdk: ^3.11.0
